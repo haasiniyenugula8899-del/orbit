@@ -2780,8 +2780,8 @@ export default function App() {
                         openProofGate
                       }
                     >
-                      VERIFY PROOF &
-                      AUTHORIZE
+                      VERIFY PROOF 
+            
 
                       <span>
                         →
@@ -3000,8 +3000,7 @@ export default function App() {
                   authorizeRecovery
                 }
               >
-                AUTHORIZE & APPLY
-                RECOVERY
+                MISSION ACCOMPLISHED
 
                 <span>
                   →
