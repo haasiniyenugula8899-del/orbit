@@ -1,15 +1,10 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { Canvas, useFrame, useLoader } from "@react-three/fiber";
 import {
-  Canvas,
-  useFrame,
-  useLoader,
-} from "@react-three/fiber";
-import {
-  Html,
-  Line,
   OrbitControls,
-  Sparkles,
   Stars,
+  Sparkles,
+  Float,
 } from "@react-three/drei";
 import * as THREE from "three";
 import "./App.css";
@@ -46,14 +41,6 @@ type Candidate = {
   explanation: string;
 };
 
-type BackendFaultPayload = {
-  fault: FaultType;
-  telemetry?: Partial<ReturnType<typeof getTelemetry>>;
-  candidates: Candidate[];
-  selectedCandidate: string;
-  eventId?: string;
-};
-
 const FAULTS: Record<
   FaultType,
   {
@@ -70,7 +57,6 @@ const FAULTS: Record<
     description:
       "Reaction wheel momentum exceeds the allowable operating limit.",
   },
-
   "Orbit Velocity Deviation": {
     icon: "⌁",
     severity: "HIGH",
@@ -78,7 +64,6 @@ const FAULTS: Record<
     description:
       "Measured orbital velocity has deviated from the expected trajectory.",
   },
-
   "Power Bus Undervoltage": {
     icon: "ϟ",
     severity: "CRITICAL",
@@ -86,7 +71,6 @@ const FAULTS: Record<
     description:
       "Spacecraft power bus voltage has fallen below its safe operating threshold.",
   },
-
   "Thermal Excursion": {
     icon: "◈",
     severity: "MEDIUM",
@@ -105,262 +89,350 @@ function now() {
 }
 
 /* -------------------------------------------------------
-   NOMINAL HIL TELEMETRY
-
-   These values are only used while the spacecraft is
-   nominal and no backend telemetry packet has arrived.
-
-   The frontend NEVER calculates recovery physics.
-   ------------------------------------------------------- */
+   TELEMETRY
+------------------------------------------------------- */
 
 function getTelemetry(theta: number) {
+  const latitude = 18.45 + Math.sin(theta) * 4.8;
+  const longitude = 73.90 + Math.cos(theta) * 8.6;
+  const altitude = 543.2 + Math.sin(theta * 2) * 4.7;
+  const velocity = 7.48 + Math.cos(theta * 1.7) * 0.018;
+  const wheelRPM = 4820 + Math.sin(theta * 1.8) * 65;
+
   return {
-    latitude: 18.45 + Math.sin(theta) * 4.8,
-    longitude: 73.9 + Math.cos(theta) * 8.6,
-    altitude: 543.2 + Math.sin(theta * 2) * 4.7,
-    velocity: 7.48 + Math.cos(theta * 1.7) * 0.018,
-    wheelRPM: 4820 + Math.sin(theta * 1.8) * 65,
+    latitude,
+    longitude,
+    altitude,
+    velocity,
+    wheelRPM,
   };
 }
 
 /* -------------------------------------------------------
-   BACKEND CONNECTION
-
-   Production:
-   VITE_ORBITGUARD_WS_URL=ws://localhost:8000/ws/orbitguard
-
-   Local/demo bridge:
-
-   window.dispatchEvent(
-     new CustomEvent("orbitguard:fault", {
-       detail: payload
-     })
-   );
-
-   Backend packet format:
-
-   {
-     fault,
-     telemetry,
-     candidates,
-     selectedCandidate,
-     eventId
-   }
+   RECOVERY ENGINE
    ------------------------------------------------------- */
 
-function subscribeToBackend(
-  onFault: (payload: BackendFaultPayload) => void,
-  onConnection: (connected: boolean) => void
-) {
-  const eventHandler = (event: Event) => {
-    const detail =
-      (event as CustomEvent<BackendFaultPayload>)
-        .detail;
+function getCandidates(fault: FaultType): Candidate[] {
+  if (fault === "Reaction Wheel Saturation") {
+    /*
+      ΔH = I(ω1 - ω2)
 
-    if (
-      detail?.fault &&
-      Array.isArray(detail.candidates) &&
-      detail.selectedCandidate
-    ) {
-      onFault(detail);
-    }
-  };
+      Magnetic:
+      τ = mB
+      t = ΔH / τ
 
-  window.addEventListener(
-    "orbitguard:fault",
-    eventHandler
-  );
+      Thruster:
+      τ = rF
+      t = ΔH / τ
+      propellant = F t / (Isp g0)
+    */
 
-  const url = import.meta.env
-    .VITE_ORBITGUARD_WS_URL as
-    | string
-    | undefined;
+    const I = 0.00185;
+    const rpmInitial = 6200;
+    const rpmTarget = 4800;
 
-  let socket: WebSocket | null = null;
+    const omegaInitial = (rpmInitial * 2 * Math.PI) / 60;
+    const omegaTarget = (rpmTarget * 2 * Math.PI) / 60;
 
-  let reconnectTimer:
-    | ReturnType<typeof setTimeout>
-    | null = null;
+    const HInitial = I * omegaInitial;
+    const HTarget = I * omegaTarget;
+    const deltaH = HInitial - HTarget;
 
-  let disposed = false;
+    const magneticTorque = 85e-6;
+    const magneticTime = deltaH / magneticTorque;
 
-  if (url) {
-    const connect = () => {
-      if (disposed) return;
+    const thrustForce = 0.055;
+    const leverArm = 0.25;
+    const thrusterTorque = thrustForce * leverArm;
+    const thrusterTime = deltaH / thrusterTorque;
 
-      try {
-        socket = new WebSocket(url);
+    const isp = 220;
+    const g0 = 9.80665;
 
-        socket.onopen = () => {
-          onConnection(true);
-        };
+    const propellant =
+      (thrustForce * thrusterTime) / (isp * g0);
 
-        socket.onmessage = (message) => {
-          try {
-            const payload =
-              JSON.parse(
-                message.data
-              ) as BackendFaultPayload;
-
-            if (
-              payload?.fault &&
-              Array.isArray(payload.candidates) &&
-              payload.selectedCandidate
-            ) {
-              onFault(payload);
-            }
-          } catch {
-            // Ignore malformed backend packets.
-          }
-        };
-
-        socket.onerror = () => {
-          onConnection(false);
-        };
-
-        socket.onclose = () => {
-          onConnection(false);
-
-          if (!disposed) {
-            reconnectTimer = setTimeout(
-              connect,
-              2500
-            );
-          }
-        };
-      } catch {
-        onConnection(false);
-
-        reconnectTimer = setTimeout(
-          connect,
-          2500
-        );
-      }
+    const magnetic: Candidate = {
+      name: "Magnetic Desaturation",
+      short: "MAGNETIC DESAT",
+      color: "#22d3ee",
+      metrics: {
+        recoveryTime: magneticTime,
+        resourceUse: 0,
+        risk: 12,
+        missionImpact: 10,
+        constraint: 95,
+      },
+      score: 0,
+      calculations: [
+        `Wheel inertia I = ${I.toFixed(5)} kg·m²`,
+        `Initial speed = ${rpmInitial} RPM`,
+        `Target speed = ${rpmTarget} RPM`,
+        `ω₁ = ${omegaInitial.toFixed(2)} rad/s`,
+        `ω₂ = ${omegaTarget.toFixed(2)} rad/s`,
+        `H₁ = Iω₁ = ${HInitial.toFixed(3)} N·m·s`,
+        `H₂ = Iω₂ = ${HTarget.toFixed(3)} N·m·s`,
+        `ΔH = ${deltaH.toFixed(3)} N·m·s`,
+        `τ = 85 μN·m`,
+        `t = ΔH / τ = ${magneticTime.toFixed(1)} s`,
+      ],
+      explanation:
+        "Uses the magnetic torque system to unload reaction-wheel momentum without consuming propellant.",
     };
 
-    connect();
-  } else {
-    onConnection(false);
+    const thruster: Candidate = {
+      name: "Thruster Momentum Dump",
+      short: "THRUSTER DUMP",
+      color: "#8b5cf6",
+      metrics: {
+        recoveryTime: thrusterTime,
+        resourceUse: propellant,
+        risk: 31,
+        missionImpact: 25,
+        constraint: 82,
+      },
+      score: 0,
+      calculations: [
+        `Required momentum reduction ΔH = ${deltaH.toFixed(3)} N·m·s`,
+        `Thrust force F = ${thrustForce.toFixed(3)} N`,
+        `Lever arm r = ${leverArm.toFixed(2)} m`,
+        `τ = rF = ${thrusterTorque.toFixed(5)} N·m`,
+        `t = ΔH / τ = ${thrusterTime.toFixed(1)} s`,
+        `Isp = ${isp} s`,
+        `ṁ = F / (Isp × g₀)`,
+        `Propellant = ${propellant.toFixed(4)} kg`,
+      ],
+      explanation:
+        "Uses thruster torque to remove stored momentum, but consumes propellant and introduces greater actuator/mission impact.",
+    };
+
+    return scoreCandidates([magnetic, thruster]);
   }
 
-  return () => {
-    disposed = true;
+  if (fault === "Orbit Velocity Deviation") {
+    const deltaV = 0.042;
+    const lowThrustAccel = 0.018;
+    const shortImpulse = 0.12;
 
-    window.removeEventListener(
-      "orbitguard:fault",
-      eventHandler
-    );
+    const lowThrustTime = deltaV / lowThrustAccel;
+    const impulseTime = deltaV / shortImpulse;
 
-    if (reconnectTimer) {
-      clearTimeout(reconnectTimer);
-    }
+    const lowThrust: Candidate = {
+      name: "Low-Thrust Correction",
+      short: "LOW-THRUST",
+      color: "#22d3ee",
+      metrics: {
+        recoveryTime: lowThrustTime,
+        resourceUse: 18,
+        risk: 11,
+        missionImpact: 8,
+        constraint: 94,
+      },
+      score: 0,
+      calculations: [
+        `Velocity error ΔV = ${deltaV.toFixed(3)} km/s`,
+        `Available low thrust acceleration = ${lowThrust.toFixed(3)} m/s²`,
+        `Correction duration = ΔV / a`,
+        `Duration = ${lowThrustTime.toFixed(2)} s`,
+        `Expected correction = ${deltaV.toFixed(3)} km/s`,
+        `Trajectory deviation after correction → nominal band`,
+      ],
+      explanation:
+        "Applies a controlled correction gradually, reducing abrupt trajectory changes and limiting mission disturbance.",
+    };
 
-    socket?.close();
-  };
-}
+    const impulse: Candidate = {
+      name: "Short Impulse Correction",
+      short: "SHORT IMPULSE",
+      color: "#8b5cf6",
+      metrics: {
+        recoveryTime: impulseTime,
+        resourceUse: 30,
+        risk: 28,
+        missionImpact: 22,
+        constraint: 83,
+      },
+      score: 0,
+      calculations: [
+        `Velocity error ΔV = ${deltaV.toFixed(3)} km/s`,
+        `Impulse acceleration = ${shortImpulse.toFixed(3)} m/s²`,
+        `Burn duration = ΔV / a`,
+        `Burn duration = ${impulseTime.toFixed(2)} s`,
+        `Required correction = ${deltaV.toFixed(3)} km/s`,
+        `Post-burn trajectory checked against tolerance`,
+      ],
+      explanation:
+        "Corrects the velocity error rapidly, but the larger instantaneous actuation produces more trajectory and actuator disturbance.",
+    };
 
-/* -------------------------------------------------------
-   TRUE FOCUS-BASED ELLIPTICAL ORBIT
+    return scoreCandidates([lowThrust, impulse]);
+  }
 
-   Earth is at the focus.
+  if (fault === "Power Bus Undervoltage") {
+    const load = 1.8;
+    const available = 1.35;
+    const deficit = load - available;
 
-   Perigee:
-     theta = 0
+    const shedding: Candidate = {
+      name: "Load Shedding",
+      short: "LOAD SHEDDING",
+      color: "#22d3ee",
+      metrics: {
+        recoveryTime: 4.2,
+        resourceUse: deficit,
+        risk: 10,
+        missionImpact: 16,
+        constraint: 96,
+      },
+      score: 0,
+      calculations: [
+        `Required load = ${load.toFixed(2)} kW`,
+        `Available power = ${available.toFixed(2)} kW`,
+        `Power deficit = ${deficit.toFixed(2)} kW`,
+        `Non-essential load removed = ${deficit.toFixed(2)} kW`,
+        `New load = ${available.toFixed(2)} kW`,
+        `Voltage margin restored above protection threshold`,
+      ],
+      explanation:
+        "Immediately reduces non-essential consumption, directly closing the power deficit without stressing the battery.",
+    };
 
-   Apogee:
-     theta = PI
+    const battery: Candidate = {
+      name: "Battery Support",
+      short: "BATTERY SUPPORT",
+      color: "#8b5cf6",
+      metrics: {
+        recoveryTime: 2.8,
+        resourceUse: 0.22,
+        risk: 25,
+        missionImpact: 13,
+        constraint: 86,
+      },
+      score: 0,
+      calculations: [
+        `Required load = ${load.toFixed(2)} kW`,
+        `Available power = ${available.toFixed(2)} kW`,
+        `Power deficit = ${deficit.toFixed(2)} kW`,
+        `Battery contribution = ${deficit.toFixed(2)} kW`,
+        `Estimated energy draw = 0.22 kWh`,
+        `Bus voltage restored`,
+      ],
+      explanation:
+        "Restores the bus quickly, but uses stored battery energy that may be required later in the mission.",
+    };
 
-   This is not a centered oval.
-   ------------------------------------------------------- */
+    return scoreCandidates([shedding, battery]);
+  }
 
-const ORBIT_A = 3.55;
-const ORBIT_E = 0.36;
+  const thermalLoad = 74;
+  const thermalLimit = 68;
+  const excess = thermalLoad - thermalLimit;
 
-const ORBIT_P =
-  ORBIT_A *
-  (1 - ORBIT_E * ORBIT_E);
-
-function orbitPoint(theta: number) {
-  const denominator =
-    1 +
-    ORBIT_E *
-      Math.cos(theta);
-
-  const r =
-    ORBIT_P /
-    denominator;
-
-  return new THREE.Vector3(
-    r * Math.cos(theta),
-    0.08 *
-      Math.sin(theta * 2),
-    r * Math.sin(theta)
-  );
-}
-
-function orbitTangent(theta: number) {
-  const denominator =
-    1 +
-    ORBIT_E *
-      Math.cos(theta);
-
-  const r =
-    ORBIT_P /
-    denominator;
-
-  const dr =
-    (ORBIT_P *
-      ORBIT_E *
-      Math.sin(theta)) /
-    (denominator *
-      denominator);
-
-  return new THREE.Vector3(
-    dr * Math.cos(theta) -
-      r * Math.sin(theta),
-
-    0.16 *
-      Math.cos(theta * 2),
-
-    dr * Math.sin(theta) +
-      r * Math.cos(theta)
-  ).normalize();
-}
-
-function orbitLinePoints(
-  scale = 1,
-  count = 320
-) {
-  return Array.from(
-    {
-      length: count + 1,
+  const loadReduction: Candidate = {
+    name: "Thermal Load Reduction",
+    short: "LOAD REDUCTION",
+    color: "#22d3ee",
+    metrics: {
+      recoveryTime: 38,
+      resourceUse: 8,
+      risk: 9,
+      missionImpact: 13,
+      constraint: 95,
     },
-    (_, index) => {
-      const theta =
-        (index / count) *
-        Math.PI *
-        2;
+    score: 0,
+    calculations: [
+      `Measured temperature = ${thermalLoad.toFixed(1)} °C`,
+      `Thermal limit = ${thermalLimit.toFixed(1)} °C`,
+      `Excess = ${excess.toFixed(1)} °C`,
+      `Non-essential thermal load reduced`,
+      `Estimated cooling rate = 0.16 °C/s`,
+      `Expected recovery = ${(excess / 0.16).toFixed(1)} s`,
+    ],
+    explanation:
+      "Reduces internal heat generation while keeping spacecraft attitude unchanged.",
+  };
 
-      const point =
-        orbitPoint(theta)
-          .multiplyScalar(scale);
+  const attitude: Candidate = {
+    name: "Attitude Reorientation",
+    short: "ATTITUDE SHIFT",
+    color: "#8b5cf6",
+    metrics: {
+      recoveryTime: 27,
+      resourceUse: 18,
+      risk: 24,
+      missionImpact: 20,
+      constraint: 84,
+    },
+    score: 0,
+    calculations: [
+      `Measured temperature = ${thermalLoad.toFixed(1)} °C`,
+      `Thermal limit = ${thermalLimit.toFixed(1)} °C`,
+      `Excess = ${excess.toFixed(1)} °C`,
+      `Spacecraft attitude changed`,
+      `Estimated cooling rate = 0.22 °C/s`,
+      `Expected recovery = ${(excess / 0.22).toFixed(1)} s`,
+    ],
+    explanation:
+      "Improves thermal rejection faster, but changes spacecraft attitude and therefore has a larger mission impact.",
+  };
 
-      return [
-        point.x,
-        point.y,
-        point.z,
-      ] as [
-        number,
-        number,
-        number
-      ];
-    }
+  return scoreCandidates([loadReduction, attitude]);
+}
+
+/*
+  Suitability score.
+
+  Higher is better.
+
+  We normalize each metric against the two candidate methods.
+  Lower recovery time/resource/risk/impact are desirable.
+  Constraint compliance is already a positive percentage.
+
+  Weights:
+  Recovery time      20%
+  Resource efficiency 20%
+  Risk               25%
+  Mission impact     15%
+  Constraint fit     20%
+*/
+function scoreCandidates(candidates: Candidate[]) {
+  const maxTime = Math.max(...candidates.map((c) => c.metrics.recoveryTime));
+  const maxResource = Math.max(
+    ...candidates.map((c) => c.metrics.resourceUse)
   );
+
+  return candidates.map((candidate) => {
+    const timeScore =
+      maxTime === 0
+        ? 100
+        : 100 * (1 - candidate.metrics.recoveryTime / maxTime);
+
+    const resourceScore =
+      maxResource === 0
+        ? 100
+        : 100 * (1 - candidate.metrics.resourceUse / maxResource);
+
+    const riskScore = 100 - candidate.metrics.risk;
+    const impactScore = 100 - candidate.metrics.missionImpact;
+    const constraintScore = candidate.metrics.constraint;
+
+    const score =
+      timeScore * 0.2 +
+      resourceScore * 0.2 +
+      riskScore * 0.25 +
+      impactScore * 0.15 +
+      constraintScore * 0.2;
+
+    return {
+      ...candidate,
+      score: Number(score.toFixed(1)),
+    };
+  });
 }
 
 /* -------------------------------------------------------
-   SPACECRAFT
-   ------------------------------------------------------- */
+   EARTH + ROCKET
+------------------------------------------------------- */
 
 function Rocket({
   theta,
@@ -369,357 +441,142 @@ function Rocket({
   theta: number;
   faultActive: boolean;
 }) {
-  const rocketRef =
-    useRef<THREE.Group>(null);
+  const rocketRef = useRef<THREE.Group>(null);
 
   useFrame(() => {
-    if (!rocketRef.current) {
-      return;
-    }
+    if (!rocketRef.current) return;
 
-    const position =
-      orbitPoint(theta);
+    const x = Math.cos(theta) * 3.35;
+    const z = Math.sin(theta) * 2.5;
+    const y = 0.18 * Math.sin(theta * 2);
 
-    const tangent =
-      orbitTangent(theta);
+    rocketRef.current.position.set(x, y, z);
 
-    rocketRef.current.position.copy(
-      position
-    );
+    const nextTheta = theta + 0.015;
 
-    const target =
-      position
-        .clone()
-        .add(tangent);
+    const nx = Math.cos(nextTheta) * 3.35;
+    const nz = Math.sin(nextTheta) * 2.5;
+    const ny = 0.18 * Math.sin(nextTheta * 2);
 
-    rocketRef.current.lookAt(
-      target
-    );
-
-    rocketRef.current.rotateX(
-      Math.PI / 2
-    );
+    rocketRef.current.lookAt(nx, ny, nz);
+    rocketRef.current.rotateX(Math.PI / 2);
   });
 
   return (
-    <group
-      ref={rocketRef}
-      scale={0.30}
-    >
-      {/* MAIN SPACECRAFT BUS */}
-
+    <group ref={rocketRef} scale={0.42}>
+      {/* main body */}
       <mesh castShadow>
-        <boxGeometry
-          args={[
-            1.15,
-            1.55,
-            1.05,
-          ]}
-        />
-
+        <cylinderGeometry args={[0.55, 0.65, 2.15, 24]} />
         <meshStandardMaterial
-          color={
-            faultActive
-              ? "#7f1d1d"
-              : "#cbd5e1"
-          }
-          metalness={0.82}
-          roughness={0.28}
+          color={faultActive ? "#ff5b5b" : "#dbeafe"}
+          metalness={0.7}
+          roughness={0.27}
         />
       </mesh>
 
-      {/* DARK EQUIPMENT DECK */}
-
-      <mesh
-        position={[
-          0,
-          0.55,
-          0,
-        ]}
-      >
-        <boxGeometry
-          args={[
-            1.22,
-            0.20,
-            1.12,
-          ]}
-        />
-
+      {/* nose */}
+      <mesh position={[0, 1.42, 0]} castShadow>
+        <coneGeometry args={[0.55, 0.8, 24]} />
         <meshStandardMaterial
-          color="#111827"
-          metalness={0.88}
-          roughness={0.24}
-        />
-      </mesh>
-
-      {/* LOWER INSTRUMENT PANEL */}
-
-      <mesh
-        position={[
-          0,
-          -0.48,
-          0,
-        ]}
-      >
-        <boxGeometry
-          args={[
-            0.86,
-            0.18,
-            0.82,
-          ]}
-        />
-
-        <meshStandardMaterial
-          color="#334155"
-          metalness={0.78}
-          roughness={0.34}
-        />
-      </mesh>
-
-      {/* SOLAR ARRAY BOOMS */}
-
-      <mesh
-        position={[
-          1.28,
-          0,
-          0,
-        ]}
-      >
-        <boxGeometry
-          args={[
-            1.35,
-            0.06,
-            0.06,
-          ]}
-        />
-
-        <meshStandardMaterial
-          color="#64748b"
-          metalness={0.90}
-          roughness={0.24}
-        />
-      </mesh>
-
-      <mesh
-        position={[
-          -1.28,
-          0,
-          0,
-        ]}
-      >
-        <boxGeometry
-          args={[
-            1.35,
-            0.06,
-            0.06,
-          ]}
-        />
-
-        <meshStandardMaterial
-          color="#64748b"
-          metalness={0.90}
-          roughness={0.24}
-        />
-      </mesh>
-
-      {/* SOLAR PANELS */}
-
-      <mesh
-        position={[
-          2.02,
-          0,
-          0,
-        ]}
-      >
-        <boxGeometry
-          args={[
-            1.45,
-            0.035,
-            0.82,
-          ]}
-        />
-
-        <meshStandardMaterial
-          color="#102d52"
-          metalness={0.58}
-          roughness={0.30}
-        />
-      </mesh>
-
-      <mesh
-        position={[
-          -2.02,
-          0,
-          0,
-        ]}
-      >
-        <boxGeometry
-          args={[
-            1.45,
-            0.035,
-            0.82,
-          ]}
-        />
-
-        <meshStandardMaterial
-          color="#102d52"
-          metalness={0.58}
-          roughness={0.30}
-        />
-      </mesh>
-
-      {/* SOLAR CELL DETAIL */}
-
-      {[-2.02, 2.02].map(
-        (x) =>
-          [-0.30, 0, 0.30].map(
-            (z) => (
-              <mesh
-                key={`${x}-${z}`}
-                position={[
-                  x,
-                  0.025,
-                  z,
-                ]}
-              >
-                <boxGeometry
-                  args={[
-                    1.28,
-                    0.012,
-                    0.012,
-                  ]}
-                />
-
-                <meshBasicMaterial
-                  color="#2563eb"
-                />
-              </mesh>
-            )
-          )
-      )}
-
-      {/* ANTENNA MAST */}
-
-      <mesh
-        position={[
-          0,
-          1.10,
-          0,
-        ]}
-      >
-        <cylinderGeometry
-          args={[
-            0.028,
-            0.028,
-            0.72,
-            10,
-          ]}
-        />
-
-        <meshStandardMaterial
-          color="#94a3b8"
-          metalness={0.90}
+          color="#f8fafc"
+          metalness={0.65}
           roughness={0.22}
         />
       </mesh>
 
-      <mesh
-        position={[
-          0,
-          1.50,
-          0,
-        ]}
-      >
-        <sphereGeometry
-          args={[
-            0.055,
-            16,
-            16,
-          ]}
-        />
-
+      {/* dark service section */}
+      <mesh position={[0, 0.35, 0]}>
+        <cylinderGeometry args={[0.58, 0.58, 0.38, 24]} />
         <meshStandardMaterial
-          color="#67e8f9"
-          emissive="#06b6d4"
-          emissiveIntensity={2.5}
+          color="#172033"
+          metalness={0.9}
+          roughness={0.2}
         />
       </mesh>
 
-      {/* FORWARD SENSOR */}
-
-      <mesh
-        position={[
-          0,
-          0.84,
-          0,
-        ]}
-      >
-        <sphereGeometry
-          args={[
-            0.18,
-            24,
-            24,
-          ]}
-        />
-
+      {/* engine */}
+      <mesh position={[0, -1.35, 0]}>
+        <cylinderGeometry args={[0.3, 0.18, 0.45, 20]} />
         <meshStandardMaterial
-          color="#0f172a"
-          metalness={0.95}
-          roughness={0.15}
+          color="#111827"
+          metalness={0.8}
+          roughness={0.2}
         />
       </mesh>
 
-      {/* ATTITUDE THRUSTERS */}
+      {/* engine glow */}
+      <pointLight
+        position={[0, -1.65, 0]}
+        intensity={faultActive ? 0.2 : 2}
+        distance={2.5}
+        color={faultActive ? "#ff453a" : "#38bdf8"}
+      />
 
-      {[
-        [0.58, 0.58, 0.42],
-        [-0.58, 0.58, 0.42],
-        [0.58, -0.58, 0.42],
-        [-0.58, -0.58, 0.42],
-      ].map(
-        ([x, y, z], index) => (
-          <mesh
-            key={index}
-            position={[
-              x,
-              y,
-              z,
-            ]}
-          >
-            <cylinderGeometry
-              args={[
-                0.055,
-                0.055,
-                0.16,
-                10,
-              ]}
-            />
+      {/* solar panel arms */}
+      <mesh position={[1.2, 0.05, 0]}>
+        <boxGeometry args={[1.35, 0.08, 0.72]} />
+        <meshStandardMaterial
+          color="#173a63"
+          metalness={0.65}
+          roughness={0.28}
+        />
+      </mesh>
 
-            <meshStandardMaterial
-              color="#475569"
-              metalness={0.88}
-              roughness={0.24}
-            />
-          </mesh>
-        )
-      )}
+      <mesh position={[-1.2, 0.05, 0]}>
+        <boxGeometry args={[1.35, 0.08, 0.72]} />
+        <meshStandardMaterial
+          color="#173a63"
+          metalness={0.65}
+          roughness={0.28}
+        />
+      </mesh>
+
+      {/* panel highlights */}
+      <mesh position={[1.2, 0.1, 0]}>
+        <boxGeometry args={[1.05, 0.015, 0.55]} />
+        <meshStandardMaterial
+          color="#2563eb"
+          emissive="#0f4c81"
+          emissiveIntensity={0.4}
+        />
+      </mesh>
+
+      <mesh position={[-1.2, 0.1, 0]}>
+        <boxGeometry args={[1.05, 0.015, 0.55]} />
+        <meshStandardMaterial
+          color="#2563eb"
+          emissive="#0f4c81"
+          emissiveIntensity={0.4}
+        />
+      </mesh>
+
+      {/* antenna */}
+      <mesh position={[0, 1.85, 0]}>
+        <cylinderGeometry args={[0.035, 0.035, 0.65, 8]} />
+        <meshStandardMaterial color="#94a3b8" />
+      </mesh>
+
+      <mesh position={[0, 2.2, 0]}>
+        <sphereGeometry args={[0.07, 12, 12]} />
+        <meshStandardMaterial
+          color="#38bdf8"
+          emissive="#38bdf8"
+          emissiveIntensity={2}
+        />
+      </mesh>
 
       {faultActive && (
         <Sparkles
-          count={28}
-          scale={2.8}
-          size={2.4}
-          speed={1.7}
+          count={30}
+          scale={2.2}
+          size={3}
+          speed={2}
           color="#ff4545"
         />
       )}
     </group>
   );
 }
-
-/* -------------------------------------------------------
-   ORBITAL SCENE
-   ------------------------------------------------------- */
 
 function EarthScene({
   theta,
@@ -728,865 +585,304 @@ function EarthScene({
   theta: number;
   faultActive: boolean;
 }) {
-  const earthTexture =
-    useLoader(
-      THREE.TextureLoader,
-      "https://threejs.org/examples/textures/planets/earth_atmos_2048.jpg"
-    );
-
-  const orbitPoints =
-    orbitLinePoints(1);
-
-  const innerGrid =
-    orbitLinePoints(0.78);
-
-  const outerGrid =
-    orbitLinePoints(1.24);
-
-  const perigee =
-    orbitPoint(0);
-
-  const apogee =
-    orbitPoint(Math.PI);
+  const earthTexture = useLoader(
+    THREE.TextureLoader,
+    "https://threejs.org/examples/textures/planets/earth_atmos_2048.jpg"
+  );
 
   return (
     <>
-      {/* DEEP SPACE BACKGROUND */}
-
-      <color
-        attach="background"
-        args={[
-          "#01040a",
-        ]}
-      />
-
-      <fog
-        attach="fog"
-        args={[
-          "#01040a",
-          15,
-          34,
-        ]}
-      />
-
-      {/* LIGHTING */}
-
-      <ambientLight
-        intensity={0.16}
-      />
+      <ambientLight intensity={0.42} />
 
       <directionalLight
-        position={[
-          6,
-          8,
-          5,
-        ]}
-        intensity={2.8}
-        color="#fff8e8"
-      />
-
-      <pointLight
-        position={[
-          -8,
-          -3,
-          -6,
-        ]}
-        intensity={0.35}
-        color="#2563eb"
-      />
-
-      {/* DEEP STARFIELD */}
-
-      <Stars
-        radius={90}
-        depth={55}
-        count={5200}
-        factor={2.2}
-        saturation={0}
-        fade
-        speed={0.18}
+        position={[5, 5, 4]}
+        intensity={2.4}
       />
 
       <Stars
-        radius={140}
-        depth={80}
-        count={1800}
-        factor={1.1}
+        radius={80}
+        depth={45}
+        count={3500}
+        factor={2}
         saturation={0}
         fade
-        speed={0.05}
+        speed={0.3}
       />
 
       <Sparkles
-        count={70}
-        scale={18}
-        size={0.8}
-        speed={0.08}
-        color="#94a3b8"
+        count={100}
+        scale={12}
+        size={1.3}
+        speed={0.15}
+        color="#7dd3fc"
       />
 
-      {/* GMAT-INSPIRED ORBITAL REFERENCE GRID */}
-
-      {[
-        0.52,
-        0.66,
-        0.82,
-        1.0,
-        1.18,
-        1.34,
-      ].map(
-        (scale) => (
-          <Line
-            key={scale}
-            points={orbitLinePoints(
-              scale
-            )}
-            color="#17365d"
-            transparent
-            opacity={0.28}
-            lineWidth={0.55}
-          />
-        )
-      )}
-
-      {/* MAIN ELLIPTICAL TRAJECTORY */}
-
-      <Line
-        points={orbitPoints}
-        color="#38bdf8"
-        transparent
-        opacity={
-          faultActive
-            ? 0.85
-            : 0.52
-        }
-        lineWidth={1.25}
-      />
-
-      <Line
-        points={innerGrid}
-        color="#1d4f7d"
-        transparent
-        opacity={0.22}
-        lineWidth={0.6}
-      />
-
-      <Line
-        points={outerGrid}
-        color="#1d4f7d"
-        transparent
-        opacity={0.18}
-        lineWidth={0.6}
-      />
-
-      {/* ORBITAL REFERENCE AXES */}
-
-      <Line
-        points={[
-          [-5.8, 0, 0],
-          [5.8, 0, 0],
-        ]}
-        color="#1a3555"
-        transparent
-        opacity={0.18}
-        lineWidth={0.5}
-      />
-
-      <Line
-        points={[
-          [0, 0, -5.8],
-          [0, 0, 5.8],
-        ]}
-        color="#1a3555"
-        transparent
-        opacity={0.18}
-        lineWidth={0.5}
-      />
-
-      {/* EARTH */}
-
-      <mesh>
-        <sphereGeometry
-          args={[
-            1.34,
-            96,
-            96,
-          ]}
+      {/* orbit path */}
+      <mesh rotation={[Math.PI / 2, 0, 0]}>
+        <torusGeometry args={[2.94, 0.008, 8, 160]} />
+        <meshBasicMaterial
+          color="#38bdf8"
+          transparent
+          opacity={0.3}
         />
+      </mesh>
 
+      {/* Earth */}
+      <mesh>
+        <sphereGeometry args={[1.48, 96, 96]} />
         <meshStandardMaterial
           map={earthTexture}
-          roughness={0.88}
+          roughness={0.92}
           metalness={0.02}
         />
       </mesh>
 
-      {/* SUBTLE CLOUD / TEXTURE SHELL */}
-
-      <mesh scale={1.018}>
-        <sphereGeometry
-          args={[
-            1.34,
-            72,
-            72,
-          ]}
-        />
-
-        <meshStandardMaterial
-          map={earthTexture}
-          transparent
-          opacity={0.16}
-          roughness={1}
-          depthWrite={false}
-        />
-      </mesh>
-
-      {/* ATMOSPHERIC RIM */}
-
+      {/* atmosphere */}
       <mesh scale={1.035}>
-        <sphereGeometry
-          args={[
-            1.34,
-            72,
-            72,
-          ]}
-        />
-
+        <sphereGeometry args={[1.48, 64, 64]} />
         <meshBasicMaterial
           color="#3b82f6"
           transparent
-          opacity={0.14}
+          opacity={0.12}
           side={THREE.BackSide}
-          depthWrite={false}
         />
       </mesh>
 
       <mesh scale={1.07}>
-        <sphereGeometry
-          args={[
-            1.34,
-            72,
-            72,
-          ]}
-        />
-
+        <sphereGeometry args={[1.48, 64, 64]} />
         <meshBasicMaterial
-          color={
-            faultActive
-              ? "#ff453a"
-              : "#38bdf8"
-          }
+          color={faultActive ? "#ff453a" : "#38bdf8"}
           transparent
-          opacity={
-            faultActive
-              ? 0.085
-              : 0.045
-          }
+          opacity={0.055}
           side={THREE.BackSide}
-          depthWrite={false}
         />
       </mesh>
 
-      {/* PERIGEE MARKER */}
-
-      <mesh position={perigee}>
-        <sphereGeometry
-          args={[
-            0.045,
-            12,
-            12,
-          ]}
-        />
-
-        <meshBasicMaterial
-          color="#22d3ee"
-        />
-      </mesh>
-
-      <Html
-        position={[
-          perigee.x + 0.18,
-          0.12,
-          perigee.z,
-        ]}
-        center
-        distanceFactor={9}
-      >
-        <div className="orbit-marker perigee-marker">
-          PERIGEE
-        </div>
-      </Html>
-
-      {/* APOGEE MARKER */}
-
-      <mesh position={apogee}>
-        <sphereGeometry
-          args={[
-            0.045,
-            12,
-            12,
-          ]}
-        />
-
-        <meshBasicMaterial
-          color="#a78bfa"
-        />
-      </mesh>
-
-      <Html
-        position={[
-          apogee.x - 0.20,
-          0.12,
-          apogee.z,
-        ]}
-        center
-        distanceFactor={9}
-      >
-        <div className="orbit-marker apogee-marker">
-          APOGEE
-        </div>
-      </Html>
-
-      <Rocket
-        theta={theta}
-        faultActive={faultActive}
-      />
+      <Rocket theta={theta} faultActive={faultActive} />
     </>
   );
 }
 
 /* -------------------------------------------------------
    APP
-   ------------------------------------------------------- */
+------------------------------------------------------- */
 
 export default function App() {
-  const [theta, setTheta] =
-    useState(0);
+  const [theta, setTheta] = useState(0);
+  const [showLanding, setShowLanding] = useState(true);
 
-  const [showLanding, setShowLanding] =
-    useState(true);
+  // LOGIN — authentication is handled entirely by the backend/database.
+  const [loginOpen, setLoginOpen] = useState(false);
+  const [loginEmail, setLoginEmail] = useState("");
+  const [loginOtp, setLoginOtp] = useState("");
+  const [otpSent, setOtpSent] = useState(false);
+  const [loginLoading, setLoginLoading] = useState(false);
+  const [loginError, setLoginError] = useState("");
 
-  const [fault, setFault] =
-    useState<FaultType | null>(null);
+  const [fault, setFault] = useState<FaultType | null>(null);
+  const [recovered, setRecovered] = useState(false);
 
-  const [recovered, setRecovered] =
-    useState(false);
+  const [plannerOpen, setPlannerOpen] = useState(false);
+  const [plannerTab, setPlannerTab] = useState<
+    "CALCULATION" | "GRAPH" | "RESULT"
+  >("CALCULATION");
 
-  const [plannerOpen, setPlannerOpen] =
-    useState(false);
-
-  const [plannerTab, setPlannerTab] =
-    useState<
-      "CALCULATION" |
-      "GRAPH" |
-      "RESULT"
-    >("CALCULATION");
-
-  const [calculationMethod, setCalculationMethod] =
-    useState(0);
-
-  const [calculationStep, setCalculationStep] =
-    useState(0);
-
+  const [calculationMethod, setCalculationMethod] = useState(0);
+  const [calculationStep, setCalculationStep] = useState(0);
   const [calculationFinished, setCalculationFinished] =
     useState(false);
 
-  const [evidenceOpen, setEvidenceOpen] =
-    useState(false);
+  const [evidenceOpen, setEvidenceOpen] = useState(false);
+  const [evidence, setEvidence] = useState<Evidence[]>([]);
 
-  const [proofGateOpen, setProofGateOpen] =
-    useState(false);
-
-  const [evidence, setEvidence] =
-    useState<Evidence[]>([]);
-
-  const [telemetry, setTelemetry] =
-    useState(getTelemetry(0));
+  const [telemetry, setTelemetry] = useState(
+    getTelemetry(0)
+  );
 
   const [selectedMethod, setSelectedMethod] =
     useState<Candidate | null>(null);
 
-  const [backendCandidates, setBackendCandidates] =
-    useState<Candidate[]>([]);
+  const candidates = useMemo(
+    () => (fault ? getCandidates(fault) : []),
+    [fault]
+  );
 
-  const [
-    backendSelectedCandidate,
-    setBackendSelectedCandidate,
-  ] = useState("");
+  const activeFault = fault ? FAULTS[fault] : null;
 
-  const [backendConnected, setBackendConnected] =
-    useState(false);
-
-  const lastBackendEvent =
-    useRef<string | null>(null);
-
-  const candidates =
-    backendCandidates;
-
-  const activeFault =
-    fault
-      ? FAULTS[fault]
-      : null;
-
-  /* -------------------------------------------------------
-     BACKEND -> AUTOMATIC ANOMALY CONTAINMENT
-     ------------------------------------------------------- */
-
-  useEffect(() => {
-    return subscribeToBackend(
-      (payload) => {
-        const eventKey =
-          payload.eventId ||
-          `${payload.fault}-${payload.selectedCandidate}-${JSON.stringify(
-            payload.telemetry || {}
-          )}`;
-
-        if (
-          lastBackendEvent.current ===
-          eventKey
-        ) {
-          return;
-        }
-
-        lastBackendEvent.current =
-          eventKey;
-
-        setBackendConnected(true);
-
-        setFault(
-          payload.fault
-        );
-
-        setRecovered(false);
-
-        setPlannerOpen(false);
-
-        setProofGateOpen(false);
-
-        setPlannerTab(
-          "CALCULATION"
-        );
-
-        setCalculationMethod(0);
-
-        setCalculationStep(0);
-
-        setCalculationFinished(
-          false
-        );
-
-        setBackendCandidates(
-          payload.candidates
-        );
-
-        setBackendSelectedCandidate(
-          payload.selectedCandidate
-        );
-
-        const backendSelection =
-          payload.candidates.find(
-            (candidate) =>
-              candidate.name ===
-              payload.selectedCandidate
-          ) || null;
-
-        setSelectedMethod(
-          backendSelection
-        );
-
-        if (
-          payload.telemetry
-        ) {
-          setTelemetry(
-            (previous) => ({
-              ...previous,
-              ...payload.telemetry,
-            })
-          );
-        }
-
-        addEvidence(
-          "ANOMALY DETECTED",
-          `${payload.fault} detected by backend telemetry.`,
-          "BLOCKED"
-        );
-
-        addEvidence(
-          "COMMAND GATE",
-          "Autonomous recovery blocked pending backend-generated evidence and recovery validation.",
-          "BLOCKED"
-        );
-
-        addEvidence(
-          "BACKEND CALCULATION PAYLOAD",
-          `${payload.candidates.length} recovery procedures received with machine-generated calculation steps. Backend selected ${payload.selectedCandidate}.`,
-          "ACTIVE"
-        );
-      },
-      setBackendConnected
-    );
-  }, []);
-
-  /* -------------------------------------------------------
-     AUTOMATIC PHYSICS ENGINE
-     ------------------------------------------------------- */
-
-  useEffect(() => {
-    if (
-      !fault ||
-      showLanding ||
-      recovered ||
-      candidates.length < 2
-    ) {
-      return;
-    }
-
-    const timer =
-      setTimeout(() => {
-        setPlannerOpen(true);
-
-        setPlannerTab(
-          "CALCULATION"
-        );
-
-        setCalculationMethod(0);
-
-        setCalculationStep(0);
-
-        setCalculationFinished(
-          false
-        );
-      }, 250);
-
-    return () =>
-      clearTimeout(timer);
-  }, [
-    fault,
-    showLanding,
-    recovered,
-    candidates.length,
-  ]);
-
-  /* -------------------------------------------------------
+  /* ---------------------------------------------
      ORBIT ANIMATION
-
-     Stops when an anomaly is contained.
-     ------------------------------------------------------- */
+  --------------------------------------------- */
 
   useEffect(() => {
     if (showLanding) return;
 
-    const timer =
-      setInterval(() => {
-        if (!fault) {
-          setTheta(
-            (previous) =>
-              previous + 0.012
-          );
-        }
-      }, 40);
+    const timer = setInterval(() => {
+      if (!fault) {
+        setTheta((prev) => prev + 0.012);
+      }
+    }, 40);
 
-    return () =>
-      clearInterval(timer);
-  }, [
-    showLanding,
-    fault,
-  ]);
+    return () => clearInterval(timer);
+  }, [showLanding, fault]);
 
   useEffect(() => {
-    if (!fault) {
-      setTelemetry(
-        getTelemetry(theta)
-      );
-    }
-  }, [
-    theta,
-    fault,
-  ]);
+    setTelemetry(getTelemetry(theta));
+  }, [theta]);
 
-  /* -------------------------------------------------------
-     EVIDENCE VAULT
-     ------------------------------------------------------- */
+  /* ---------------------------------------------
+     EVIDENCE
+  --------------------------------------------- */
 
   function addEvidence(
     type: string,
     detail: string,
     status: EvidenceStatus
   ) {
-    setEvidence(
-      (previous) => [
-        ...previous,
-        {
-          id:
-            Date.now() +
-            Math.random(),
-
-          time: now(),
-
-          type,
-
-          detail,
-
-          status,
-        },
-      ]
-    );
+    setEvidence((prev) => [
+      ...prev,
+      {
+        id: Date.now() + Math.random(),
+        time: now(),
+        type,
+        detail,
+        status,
+      },
+    ]);
   }
 
-  /* -------------------------------------------------------
-     NO FRONTEND FAULT SELECTION.
+  /* ---------------------------------------------
+     INJECT FAULT
+  --------------------------------------------- */
 
-     Backend is the source of truth.
-     ------------------------------------------------------- */
+  function injectFault(type: FaultType) {
+    setFault(type);
+    setRecovered(false);
+    setSelectedMethod(null);
 
-  function openPlanner() {
-    if (
-      !fault ||
-      candidates.length < 2
-    ) {
-      return;
-    }
-
-    setPlannerOpen(true);
-
-    setPlannerTab(
-      "CALCULATION"
-    );
-
+    setPlannerTab("CALCULATION");
     setCalculationMethod(0);
-
     setCalculationStep(0);
+    setCalculationFinished(false);
 
-    setCalculationFinished(
-      false
+    addEvidence(
+      "ANOMALY DETECTED",
+      `${type} detected in spacecraft telemetry.`,
+      "BLOCKED"
     );
 
     addEvidence(
+      "COMMAND GATE",
+      "Autonomous recovery blocked pending evidence-backed procedure.",
+      "BLOCKED"
+    );
+  }
+
+  /* ---------------------------------------------
+     OPEN PLANNER
+  --------------------------------------------- */
+
+  function openPlanner() {
+    if (!fault) return;
+
+    setPlannerOpen(true);
+    setPlannerTab("CALCULATION");
+    setCalculationMethod(0);
+    setCalculationStep(0);
+    setCalculationFinished(false);
+
+    addEvidence(
       "RECOVERY PLANNER",
-      "Backend recovery procedures opened for evidence review.",
+      "Candidate recovery procedures generated for evaluation.",
       "ACTIVE"
     );
   }
 
-  /* -------------------------------------------------------
-     LIVE BACKEND CALCULATION REVEAL
-
-     IMPORTANT:
-     This timer only reveals backend-generated strings.
-     It does NOT calculate physics.
-     ------------------------------------------------------- */
+  /* ---------------------------------------------
+     LIVE CALCULATION
+  --------------------------------------------- */
 
   useEffect(() => {
-    if (
-      !plannerOpen ||
-      !fault
-    ) {
-      return;
+    if (!plannerOpen || !fault) return;
+
+    if (calculationFinished) return;
+
+    const current = candidates[calculationMethod];
+
+    if (!current) return;
+
+    if (calculationStep < current.calculations.length) {
+      const timer = setTimeout(() => {
+        setCalculationStep((prev) => prev + 1);
+      }, 650);
+
+      return () => clearTimeout(timer);
     }
 
     if (
-      calculationFinished
+      calculationStep >= current.calculations.length &&
+      calculationMethod < candidates.length - 1
     ) {
-      return;
-    }
+      const timer = setTimeout(() => {
+        addEvidence(
+          "METHOD SIMULATED",
+          `${current.name} simulation completed with suitability score ${current.score}/100.`,
+          "PASS"
+        );
 
-    const current =
-      candidates[
-        calculationMethod
-      ];
+        setCalculationMethod((prev) => prev + 1);
+        setCalculationStep(0);
+      }, 800);
 
-    if (!current) {
-      return;
-    }
-
-    if (
-      calculationStep <
-      current.calculations.length
-    ) {
-      const timer =
-        setTimeout(() => {
-          setCalculationStep(
-            (previous) =>
-              previous + 1
-          );
-        }, 650);
-
-      return () =>
-        clearTimeout(timer);
+      return () => clearTimeout(timer);
     }
 
     if (
-      calculationStep >=
-        current.calculations.length &&
-      calculationMethod <
-        candidates.length - 1
+      calculationStep >= current.calculations.length &&
+      calculationMethod === candidates.length - 1
     ) {
-      const timer =
-        setTimeout(() => {
-          addEvidence(
-            "METHOD SIMULATED",
-            `${current.name} backend calculation stream completed with suitability score ${current.score}/100.`,
-            "PASS"
-          );
+      const timer = setTimeout(() => {
+        addEvidence(
+          "METHOD SIMULATED",
+          `${current.name} simulation completed with suitability score ${current.score}/100.`,
+          "PASS"
+        );
 
-          setCalculationMethod(
-            (previous) =>
-              previous + 1
-          );
+        setCalculationFinished(true);
 
-          setCalculationStep(0);
-        }, 800);
+        const best = candidates.reduce((a, b) =>
+          a.score > b.score ? a : b
+        );
 
-      return () =>
-        clearTimeout(timer);
-    }
+        setSelectedMethod(best);
 
-    if (
-      calculationStep >=
-        current.calculations.length &&
-      calculationMethod ===
-        candidates.length - 1
-    ) {
-      const timer =
-        setTimeout(() => {
-          addEvidence(
-            "METHOD SIMULATED",
-            `${current.name} backend calculation stream completed with suitability score ${current.score}/100.`,
-            "PASS"
-          );
+        addEvidence(
+          "CONSTRAINT CHECK",
+          `Both procedures passed feasibility checks. Decision model selected ${best.name} at ${best.score}/100 suitability.`,
+          "PASS"
+        );
+      }, 800);
 
-          const backendSelection =
-            candidates.find(
-              (candidate) =>
-                candidate.name ===
-                backendSelectedCandidate
-            ) || null;
-
-          if (
-            !backendSelection
-          ) {
-            addEvidence(
-              "DECISION BLOCKED",
-              "Backend did not provide a valid selected recovery procedure.",
-              "BLOCKED"
-            );
-
-            return;
-          }
-
-          setSelectedMethod(
-            backendSelection
-          );
-
-          setCalculationFinished(
-            true
-          );
-
-          addEvidence(
-            "CONSTRAINT CHECK",
-            `Backend decision selected ${backendSelection.name} at ${backendSelection.score}/100 suitability. Frontend did not recompute the score.`,
-            "PASS"
-          );
-        }, 800);
-
-      return () =>
-        clearTimeout(timer);
+      return () => clearTimeout(timer);
     }
   }, [
     plannerOpen,
     fault,
     candidates,
-    backendSelectedCandidate,
     calculationMethod,
     calculationStep,
     calculationFinished,
   ]);
 
-  /* -------------------------------------------------------
-     PROOF GATE
-     ------------------------------------------------------- */
-
-  function openProofGate() {
-    if (
-      !selectedMethod ||
-      !fault ||
-      !calculationFinished
-    ) {
-      return;
-    }
-
-    const checks = [
-      fault !== null,
-
-      calculationFinished &&
-        candidates.length >= 2,
-
-      candidates.every(
-        (candidate) =>
-          Number.isFinite(
-            candidate.score
-          ) &&
-          Number.isFinite(
-            candidate.metrics
-              .recoveryTime
-          ) &&
-          Number.isFinite(
-            candidate.metrics.risk
-          ) &&
-          Number.isFinite(
-            candidate.metrics
-              .constraint
-          )
-      ),
-
-      selectedMethod.metrics
-        .constraint >= 80,
-
-      Number.isFinite(
-        selectedMethod.score
-      ),
-
-      selectedMethod.name ===
-        backendSelectedCandidate,
-    ];
-
-    if (
-      checks.every(Boolean)
-    ) {
-      addEvidence(
-        "PROOF GATE CHECK",
-        "Anomaly evidence, backend calculations, numerical validity, selected-procedure identity and recovery constraints passed machine-checkable checks.",
-        "PASS"
-      );
-
-      setProofGateOpen(
-        true
-      );
-    } else {
-      addEvidence(
-        "PROOF GATE BLOCKED",
-        "Recovery cannot be authorized because one or more machine-checkable evidence checks failed.",
-        "BLOCKED"
-      );
-    }
-  }
-
-  function authorizeRecovery() {
-    setProofGateOpen(false);
-    applyRecovery();
-  }
+  /* ---------------------------------------------
+     APPLY RECOVERY
+  --------------------------------------------- */
 
   function applyRecovery() {
-    if (
-      !selectedMethod ||
-      !fault
-    ) {
-      return;
-    }
+    if (!selectedMethod || !fault) return;
 
     addEvidence(
       "RECOVERY AUTHORIZED",
-      `${selectedMethod.name} selected by backend after candidate comparison.`,
+      `${selectedMethod.name} selected after candidate comparison.`,
       "PASS"
     );
 
@@ -1597,7 +893,6 @@ export default function App() {
     );
 
     setRecovered(true);
-
     setPlannerOpen(false);
 
     setTimeout(() => {
@@ -1615,60 +910,124 @@ export default function App() {
     }, 1300);
   }
 
-  /* -------------------------------------------------------
-     CONTINUE / RESET
-
-     CONTINUE:
-       preserves Evidence Vault.
-
-     RESET:
-       only action that clears Evidence Vault.
-     ------------------------------------------------------- */
+  /* ---------------------------------------------
+     CONTINUE MISSION
+  --------------------------------------------- */
 
   function continueMission() {
     setFault(null);
-
     setRecovered(false);
-
     setPlannerOpen(false);
-
-    setProofGateOpen(false);
-
     setSelectedMethod(null);
-
-    setBackendCandidates([]);
-
-    setBackendSelectedCandidate("");
   }
+
+  /* ---------------------------------------------
+     RESET
+  --------------------------------------------- */
 
   function resetMission() {
     setFault(null);
-
     setRecovered(false);
-
     setPlannerOpen(false);
-
-    setProofGateOpen(false);
-
     setSelectedMethod(null);
-
-    setBackendCandidates([]);
-
-    setBackendSelectedCandidate("");
-
     setEvidence([]);
-
     setShowLanding(true);
-
     setTheta(0);
-
-    lastBackendEvent.current =
-      null;
   }
 
-  /* -------------------------------------------------------
-     LANDING PAGE
-     ------------------------------------------------------- */
+  /* ---------------------------------------------
+     LOGIN / OTP
+     The frontend does NOT contain an authorized-user list.
+     The backend/database decides whether an email is allowed.
+  --------------------------------------------- */
+
+  async function requestLoginOtp() {
+    const email = loginEmail.trim().toLowerCase();
+
+    if (!email) {
+      setLoginError("Please enter your mission-control email.");
+      return;
+    }
+
+    setLoginLoading(true);
+    setLoginError("");
+
+    try {
+      const response = await fetch("/api/auth/request-otp", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ email }),
+      });
+
+      const data = await response.json();
+
+      if (!response.ok) {
+        throw new Error(data.message || "Unable to send OTP.");
+      }
+
+      setOtpSent(true);
+    } catch (error) {
+      setLoginError(
+        error instanceof Error
+          ? error.message
+          : "Unable to send OTP."
+      );
+    } finally {
+      setLoginLoading(false);
+    }
+  }
+
+  async function verifyLoginOtp() {
+    const email = loginEmail.trim().toLowerCase();
+
+    if (!/^\d{6}$/.test(loginOtp)) {
+      setLoginError("Enter the 6-digit OTP.");
+      return;
+    }
+
+    setLoginLoading(true);
+    setLoginError("");
+
+    try {
+      const response = await fetch("/api/auth/verify-otp", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          email,
+          otp: loginOtp,
+        }),
+      });
+
+      const data = await response.json();
+
+      if (!response.ok || !data.success) {
+        throw new Error(data.message || "Invalid or expired OTP.");
+      }
+
+      setLoginOpen(false);
+      setLoginEmail("");
+      setLoginOtp("");
+      setOtpSent(false);
+      setLoginError("");
+      setShowLanding(false);
+    } catch (error) {
+      setLoginError(
+        error instanceof Error
+          ? error.message
+          : "Verification failed."
+      );
+    } finally {
+      setLoginLoading(false);
+    }
+  }
+
+  /* ---------------------------------------------
+     LANDING
+  --------------------------------------------- */
 
   if (showLanding) {
     return (
@@ -1692,42 +1051,117 @@ export default function App() {
           </h1>
 
           <p>
-            Autonomous anomaly detection,
-            recovery planning,
-            evidence validation
-            and mission resumption.
+            Autonomous anomaly detection, recovery planning,
+            evidence validation and mission resumption.
           </p>
 
           <button
             className="mission-button"
-            onClick={() =>
-              setShowLanding(false)
-            }
+            onClick={() => {
+              setLoginOpen(true);
+              setLoginError("");
+            }}
           >
-            <span>
-              START MISSION
-            </span>
-
+            <span>START MISSION</span>
             <b>→</b>
           </button>
+
+          {loginOpen && (
+            <div className="mission-login-panel">
+              <div className="mission-login-kicker">
+                MISSION CONTROL ACCESS // OTP AUTHENTICATION
+              </div>
+
+              <h2>Authorized Access</h2>
+
+              <p>
+                Enter your registered mission email. A one-time
+                password will be sent to the email by the backend.
+              </p>
+
+              {!otpSent ? (
+                <>
+                  <input
+                    className="mission-login-input"
+                    type="email"
+                    placeholder="mission email"
+                    value={loginEmail}
+                    onChange={(e) => {
+                      setLoginEmail(e.target.value);
+                      setLoginError("");
+                    }}
+                    autoComplete="email"
+                  />
+
+                  <button
+                    className="mission-login-button"
+                    onClick={requestLoginOtp}
+                    disabled={loginLoading}
+                  >
+                    {loginLoading ? "SENDING OTP..." : "SEND OTP"}
+                    <span>→</span>
+                  </button>
+                </>
+              ) : (
+                <>
+                  <div className="mission-login-email">
+                    OTP sent to <strong>{loginEmail}</strong>
+                  </div>
+
+                  <input
+                    className="mission-login-input otp-input"
+                    type="text"
+                    inputMode="numeric"
+                    maxLength={6}
+                    placeholder="••••••"
+                    value={loginOtp}
+                    onChange={(e) => {
+                      const value = e.target.value
+                        .replace(/\D/g, "")
+                        .slice(0, 6);
+                      setLoginOtp(value);
+                      setLoginError("");
+                    }}
+                    autoComplete="one-time-code"
+                  />
+
+                  <button
+                    className="mission-login-button"
+                    onClick={verifyLoginOtp}
+                    disabled={loginLoading}
+                  >
+                    {loginLoading ? "VERIFYING..." : "VERIFY & ENTER"}
+                    <span>→</span>
+                  </button>
+
+                  <button
+                    className="mission-login-back"
+                    onClick={() => {
+                      setOtpSent(false);
+                      setLoginOtp("");
+                      setLoginError("");
+                    }}
+                  >
+                    ← CHANGE EMAIL
+                  </button>
+                </>
+              )}
+
+              {loginError && (
+                <div className="mission-login-error">
+                  {loginError}
+                </div>
+              )}
+            </div>
+          )}
         </div>
 
         <div className="landing-bottom">
-          <span>
-            ZERO-TRUST RECOVERY
-          </span>
-
+          <span>ZERO-TRUST RECOVERY</span>
           <span>•</span>
-
-          <span>
-            PHYSICS VALIDATED
-          </span>
-
+          <span>PHYSICS VALIDATED</span>
           <span>•</span>
-
-          <span>
-            AUTONOMOUS CONTROL
-          </span>
+          <span>AUTONOMOUS CONTROL</span>
         </div>
       </div>
     );
@@ -1736,16 +1170,11 @@ export default function App() {
   return (
     <div className="app">
       {/* TOP BAR */}
-
       <header className="topbar">
         <div>
-          <div className="brand">
-            ORBITGUARD-AI
-          </div>
-
+          <div className="brand">ORBITGUARD-AI</div>
           <div className="brand-sub">
-            ZERO-TRUST AUTONOMOUS
-            SATELLITE CONTROL
+            ZERO-TRUST AUTONOMOUS SATELLITE CONTROL
           </div>
         </div>
 
@@ -1766,100 +1195,61 @@ export default function App() {
 
           <button
             className="vault-button"
-            onClick={() =>
-              setEvidenceOpen(true)
-            }
+            onClick={() => setEvidenceOpen(true)}
           >
             EVIDENCE VAULT
-
-            <b>
-              {evidence.length}
-            </b>
+            <b>{evidence.length}</b>
           </button>
 
           <button
             className="reset-button"
-            onClick={
-              resetMission
-            }
+            onClick={resetMission}
           >
             RESET MISSION
           </button>
         </div>
       </header>
 
-      {/* MAIN DASHBOARD */}
-
+      {/* MAIN */}
       <main className="dashboard">
         {/* LEFT */}
-
         <aside className="left-panel">
           <div className="panel-title">
             LIVE TELEMETRY
           </div>
 
           <div className="telemetry-card">
-            <span>
-              LATITUDE
-            </span>
-
+            <span>LATITUDE</span>
             <strong>
-              {telemetry.latitude.toFixed(
-                4
-              )}
-              °
+              {telemetry.latitude.toFixed(4)}°
             </strong>
           </div>
 
           <div className="telemetry-card">
-            <span>
-              LONGITUDE
-            </span>
-
+            <span>LONGITUDE</span>
             <strong>
-              {telemetry.longitude.toFixed(
-                4
-              )}
-              °
+              {telemetry.longitude.toFixed(4)}°
             </strong>
           </div>
 
           <div className="telemetry-card">
-            <span>
-              ALTITUDE
-            </span>
-
+            <span>ALTITUDE</span>
             <strong>
-              {telemetry.altitude.toFixed(
-                2
-              )}{" "}
-              km
+              {telemetry.altitude.toFixed(2)} km
             </strong>
           </div>
 
           <div className="telemetry-card">
-            <span>
-              VELOCITY
-            </span>
-
+            <span>VELOCITY</span>
             <strong>
-              {telemetry.velocity.toFixed(
-                3
-              )}{" "}
-              km/s
+              {telemetry.velocity.toFixed(3)} km/s
             </strong>
           </div>
 
           <div className="telemetry-card">
-            <span>
-              RW-Z SPEED
-            </span>
-
+            <span>RW-Z SPEED</span>
             <strong>
-              {telemetry.wheelRPM.toFixed(
-                0
-              )}{" "}
-              RPM
+              {telemetry.wheelRPM.toFixed(0)} RPM
             </strong>
           </div>
 
@@ -1868,10 +1258,7 @@ export default function App() {
           </div>
 
           <div className="mission-phase">
-            <span>
-              MISSION PHASE
-            </span>
-
+            <span>MISSION PHASE</span>
             <b>
               {fault
                 ? recovered
@@ -1880,77 +1267,36 @@ export default function App() {
                 : "NOMINAL ORBIT"}
             </b>
           </div>
-
-          <div className="connection-card">
-            <span>
-              BACKEND LINK
-            </span>
-
-            <strong>
-              <i
-                className={
-                  backendConnected
-                    ? "connection-dot live"
-                    : "connection-dot"
-                }
-              />
-
-              {backendConnected
-                ? "CONNECTED"
-                : "WAITING"}
-            </strong>
-          </div>
         </aside>
 
         {/* CENTER */}
-
         <section className="space-view">
           <div className="space-label">
-            <span>
-              ORBITAL VIEW
-            </span>
-
-            <span>
-              LEO // 543 KM
-            </span>
+            <span>ORBITAL VIEW</span>
+            <span>LEO // 543 KM</span>
           </div>
 
           <Canvas
             camera={{
-              position: [
-                0,
-                3.9,
-                9.8,
-              ],
+              position: [0, 3.9, 9.8],
               fov: 43,
             }}
             dpr={[1, 2]}
-            gl={{
-              antialias: true,
-            }}
           >
             <EarthScene
               theta={theta}
-              faultActive={Boolean(
-                fault &&
-                  !recovered
-              )}
+              faultActive={Boolean(fault && !recovered)}
             />
 
             <OrbitControls
               enablePan={false}
               enableZoom={false}
               autoRotate={false}
-              enableDamping
-              dampingFactor={0.06}
             />
           </Canvas>
 
           <div className="orbit-readout">
-            <span>
-              ORBIT TRACK
-            </span>
-
+            <span>ORBIT TRACK</span>
             <strong>
               {fault
                 ? recovered
@@ -1960,1149 +1306,637 @@ export default function App() {
             </strong>
           </div>
 
-          <div className="orbit-info">
-            <span>
-              ECCENTRICITY
-            </span>
-
-            <b>
-              {ORBIT_E.toFixed(2)}
-            </b>
-
-            <span>
-              PERIGEE / APOGEE
-            </span>
-
-            <b>
-              FOCUS-BASED
-            </b>
-          </div>
-
-          {fault &&
-            !recovered && (
-              <div className="anomaly-beacon">
-                <div className="beacon-pulse" />
-
-                <div>
-                  <small>
-                    ANOMALY
-                  </small>
-
-                  <strong>
-                    {fault}
-                  </strong>
-                </div>
+          {fault && !recovered && (
+            <div className="anomaly-beacon">
+              <div className="beacon-pulse" />
+              <div>
+                <small>ANOMALY</small>
+                <strong>{fault}</strong>
               </div>
-            )}
+            </div>
+          )}
 
           {recovered && (
             <div className="recovery-beacon">
               <span>✓</span>
-
               <div>
-                <small>
-                  RECOVERY VERIFIED
-                </small>
-
-                <strong>
-                  MISSION RESUMED
-                </strong>
+                <small>RECOVERY VERIFIED</small>
+                <strong>MISSION RESUMED</strong>
               </div>
             </div>
           )}
         </section>
 
         {/* RIGHT */}
-
         <aside className="right-panel">
           <div className="panel-title">
             ANOMALY CONTROL
           </div>
 
           {!fault && (
-            <div className="backend-awaiting">
+            <>
               <div className="control-description">
-                Awaiting backend
-                telemetry. Fault
-                selection is disabled
-                in the frontend.
+                Inject a controlled spacecraft anomaly
+                to test the evidence-gated recovery
+                workflow.
               </div>
 
-              <div className="evidence-gate">
-                <div>◌</div>
+              <div className="fault-list">
+                {(Object.keys(FAULTS) as FaultType[]).map(
+                  (type) => {
+                    const info = FAULTS[type];
 
-                <div>
-                  <b>
-                    BACKEND FAULT MONITOR
-                  </b>
-
-                  <span>
-                    When a fault is
-                    detected, the
-                    spacecraft is
-                    automatically
-                    contained and the
-                    Recovery Planner
-                    opens.
-                  </span>
-                </div>
-              </div>
-
-              <div className="backend-stream-status">
-                <span className="stream-pulse" />
-
-                <div>
-                  <b>
-                    AGENT STREAM ARMED
-                  </b>
-
-                  <small>
-                    Detection →
-                    containment →
-                    physics → proof →
-                    recovery
-                  </small>
-                </div>
-              </div>
-            </div>
-          )}
-
-          {fault &&
-            activeFault && (
-              <div className="active-anomaly">
-                <div
-                  className="active-anomaly-header"
-                  style={{
-                    borderColor:
-                      activeFault.color,
-                  }}
-                >
-                  <div>
-                    <small>
-                      ACTIVE ANOMALY
-                    </small>
-
-                    <h2>
-                      {fault}
-                    </h2>
-                  </div>
-
-                  <span
-                    className="severity-pill"
-                    style={{
-                      color:
-                        activeFault.color,
-                    }}
-                  >
-                    {
-                      activeFault.severity
-                    }
-                  </span>
-                </div>
-
-                <p>
-                  {
-                    activeFault.description
-                  }
-                </p>
-
-                {!recovered ? (
-                  <>
-                    <div className="gate-box">
-                      <div className="gate-icon">
-                        !
-                      </div>
-
-                      <div>
-                        <b>
-                          COMMAND BLOCKED
-                        </b>
-
-                        <span>
-                          Recovery
-                          requires
-                          evidence
-                          validation.
+                    return (
+                      <button
+                        className="fault-button"
+                        key={type}
+                        onClick={() => injectFault(type)}
+                      >
+                        <span
+                          className="fault-icon"
+                          style={{
+                            color: info.color,
+                          }}
+                        >
+                          {info.icon}
                         </span>
-                      </div>
-                    </div>
 
-                    <button
-                      className="planner-button"
-                      onClick={
-                        openPlanner
-                      }
-                    >
-                      OPEN RECOVERY
-                      PLANNER
+                        <span className="fault-info">
+                          <b>{type}</b>
+                          <small>
+                            {info.severity} SEVERITY
+                          </small>
+                        </span>
 
-                      <span>
-                        →
-                      </span>
-                    </button>
-                  </>
-                ) : (
-                  <>
-                    <div className="verified-box">
-                      <div>✓</div>
-
-                      <span>
-                        <b>
-                          RECOVERY VERIFIED
-                        </b>
-
-                        <small>
-                          Telemetry is
-                          back inside
-                          the safe
-                          envelope.
-                        </small>
-                      </span>
-                    </div>
-
-                    <button
-                      className="continue-button"
-                      onClick={
-                        continueMission
-                      }
-                    >
-                      CONTINUE MISSION
-                      →
-                    </button>
-                  </>
+                        <span className="arrow">
+                          →
+                        </span>
+                      </button>
+                    );
+                  }
                 )}
               </div>
-            )}
+            </>
+          )}
+
+          {fault && activeFault && (
+            <div className="active-anomaly">
+              <div
+                className="active-anomaly-header"
+                style={{
+                  borderColor: activeFault.color,
+                }}
+              >
+                <div>
+                  <small>ACTIVE ANOMALY</small>
+                  <h2>{fault}</h2>
+                </div>
+
+                <span
+                  className="severity-pill"
+                  style={{
+                    color: activeFault.color,
+                  }}
+                >
+                  {activeFault.severity}
+                </span>
+              </div>
+
+              <p>{activeFault.description}</p>
+
+              {!recovered ? (
+                <>
+                  <div className="gate-box">
+                    <div className="gate-icon">
+                      !
+                    </div>
+                    <div>
+                      <b>COMMAND BLOCKED</b>
+                      <span>
+                        Recovery requires evidence
+                        validation.
+                      </span>
+                    </div>
+                  </div>
+
+                  <button
+                    className="planner-button"
+                    onClick={openPlanner}
+                  >
+                    OPEN RECOVERY PLANNER
+                    <span>→</span>
+                  </button>
+                </>
+              ) : (
+                <>
+                  <div className="verified-box">
+                    <div>✓</div>
+                    <span>
+                      <b>RECOVERY VERIFIED</b>
+                      <small>
+                        Telemetry is back inside the
+                        safe envelope.
+                      </small>
+                    </span>
+                  </div>
+
+                  <button
+                    className="continue-button"
+                    onClick={continueMission}
+                  >
+                    CONTINUE MISSION →
+                  </button>
+                </>
+              )}
+            </div>
+          )}
         </aside>
       </main>
 
-      {/* =====================================================
-          RECOVERY PLANNER
-      ===================================================== */}
+      {/* -------------------------------------------------
+          RECOVERY PLANNER MODAL
+      ------------------------------------------------- */}
 
-      {plannerOpen &&
-        fault && (
-          <div className="modal-backdrop">
-            <div className="planner-modal">
-              <div className="planner-header">
-                <div>
-                  <span>
-                    RECOVERY PLANNER //
-                    PHYSICS ENGINE
-                  </span>
-
-                  <h2>
-                    {fault}
-                  </h2>
-                </div>
-
-                <button
-                  onClick={() =>
-                    setPlannerOpen(
-                      false
-                    )
-                  }
-                >
-                  ×
-                </button>
-              </div>
-
-              <div className="planner-tabs">
-                <button
-                  className={
-                    plannerTab ===
-                    "CALCULATION"
-                      ? "active cyan-tab"
-                      : "cyan-tab"
-                  }
-                  onClick={() =>
-                    setPlannerTab(
-                      "CALCULATION"
-                    )
-                  }
-                >
-                  01 · LIVE
-                  CALCULATION
-                </button>
-
-                <button
-                  disabled={
-                    !calculationFinished
-                  }
-                  className={
-                    plannerTab ===
-                    "GRAPH"
-                      ? "active purple-tab"
-                      : "purple-tab"
-                  }
-                  onClick={() =>
-                    setPlannerTab(
-                      "GRAPH"
-                    )
-                  }
-                >
-                  02 · METHOD GRAPH
-                </button>
-
-                <button
-                  disabled={
-                    !calculationFinished
-                  }
-                  className={
-                    plannerTab ===
-                    "RESULT"
-                      ? "active green-tab"
-                      : "green-tab"
-                  }
-                  onClick={() =>
-                    setPlannerTab(
-                      "RESULT"
-                    )
-                  }
-                >
-                  03 · VIEW RESULT
-                </button>
-              </div>
-
-              {/* CALCULATION */}
-
-              {plannerTab ===
-                "CALCULATION" && (
-                <div className="calculation-view">
-                  <div className="calculation-progress">
-                    <div
-                      className="progress-fill"
-                      style={{
-                        width:
-                          calculationFinished
-                            ? "100%"
-                            : `${
-                                ((calculationMethod +
-                                  calculationStep /
-                                    Math.max(
-                                      candidates[
-                                        calculationMethod
-                                      ]?.calculations
-                                        .length ||
-                                        1,
-                                      1
-                                    )) /
-                                  Math.max(
-                                    candidates.length,
-                                    1
-                                  )) *
-                                100
-                              }%`,
-                      }}
-                    />
-                  </div>
-
-                  <div className="method-running">
-                    METHOD{" "}
-                    {calculationMethod +
-                      1}{" "}
-                    OF{" "}
-                    {
-                      candidates.length
-                    }
-                  </div>
-
-                  <div className="candidate-grid">
-                    {candidates.map(
-                      (
-                        candidate,
-                        index
-                      ) => (
-                        <div
-                          className={`candidate-card ${
-                            index ===
-                            calculationMethod
-                              ? "running"
-                              : index <
-                                  calculationMethod ||
-                                calculationFinished
-                                ? "complete"
-                                : ""
-                          }`}
-                          key={
-                            candidate.name
-                          }
-                        >
-                          <div
-                            className="candidate-accent"
-                            style={{
-                              background:
-                                candidate.color,
-                            }}
-                          />
-
-                          <div>
-                            <small>
-                              METHOD{" "}
-                              {index +
-                                1}
-                            </small>
-
-                            <h3>
-                              {
-                                candidate.name
-                              }
-                            </h3>
-                          </div>
-
-                          <span>
-                            {index <
-                                calculationMethod ||
-                            calculationFinished
-                              ? "✓"
-                              : index ===
-                                  calculationMethod
-                                ? "CALCULATING"
-                                : "QUEUED"}
-                          </span>
-                        </div>
-                      )
-                    )}
-                  </div>
-
-                  {!calculationFinished && (
-                    <div className="live-calculation-box">
-                      <div className="live-header">
-                        <span className="live-dot" />
-
-                        LIVE BACKEND
-                        CALCULATION STREAM
-                      </div>
-
-                      <p className="backend-calc-note">
-                        Formulae, inputs and
-                        results are received
-                        from the recovery
-                        engine. The frontend
-                        only reveals the
-                        evidence progressively.
-                      </p>
-
-                      <h3>
-                        {
-                          candidates[
-                            calculationMethod
-                          ]?.name
-                        }
-                      </h3>
-
-                      <div className="equation-list">
-                        {
-                          candidates[
-                            calculationMethod
-                          ]?.calculations.map(
-                            (
-                              line,
-                              index
-                            ) => (
-                              <div
-                                className={
-                                  index <
-                                  calculationStep
-                                    ? "equation visible"
-                                    : "equation"
-                                }
-                                key={`${line}-${index}`}
-                              >
-                                <span>
-                                  {index <
-                                  calculationStep
-                                    ? "✓"
-                                    : "○"}
-                                </span>
-
-                                <code>
-                                  {line}
-                                </code>
-                              </div>
-                            )
-                          )
-                        }
-                      </div>
-
-                      <div className="calculating-text">
-                        {calculationStep <
-                        (candidates[
-                          calculationMethod
-                        ]?.calculations
-                          .length ||
-                          0)
-                          ? "STREAMING BACKEND EVIDENCE..."
-                          : calculationMethod <
-                              candidates.length -
-                                1
-                            ? "METHOD COMPLETE — LOADING NEXT METHOD"
-                            : "ALL METHODS CALCULATED"}
-                      </div>
-                    </div>
-                  )}
-
-                  {calculationFinished && (
-                    <div className="calculation-complete">
-                      <div className="complete-icon">
-                        ✓
-                      </div>
-
-                      <div>
-                        <h3>
-                          Both recovery
-                          procedures
-                          calculated.
-                        </h3>
-
-                        <p>
-                          No recovery
-                          command has
-                          been executed.
-                          The system has
-                          only simulated
-                          and compared
-                          the
-                          backend-supplied
-                          candidate
-                          procedures.
-                        </p>
-                      </div>
-                    </div>
-                  )}
-                </div>
-              )}
-
-              {/* GRAPH */}
-
-              {plannerTab ===
-                "GRAPH" && (
-                <div className="graph-view">
-                  <div className="graph-heading">
-                    <div>
-                      <span>
-                        COMPARATIVE
-                        ANALYSIS
-                      </span>
-
-                      <h3>
-                        Backend
-                        suitability
-                        comparison
-                      </h3>
-                    </div>
-
-                    <div className="score-legend">
-                      Higher
-                      suitability =
-                      better
-                    </div>
-                  </div>
-
-                  <div className="graph-card">
-                    {candidates.map(
-                      (candidate) => (
-                        <div
-                          className="graph-row"
-                          key={
-                            candidate.name
-                          }
-                        >
-                          <div className="graph-label">
-                            <span
-                              style={{
-                                color:
-                                  candidate.color,
-                              }}
-                            >
-                              ●
-                            </span>
-
-                            {
-                              candidate.short
-                            }
-                          </div>
-
-                          <div className="bar-track">
-                            <div
-                              className="bar-fill"
-                              style={{
-                                width: `${candidate.score}%`,
-                                background:
-                                  candidate.color,
-                                boxShadow: `0 0 18px ${candidate.color}66`,
-                              }}
-                            />
-                          </div>
-
-                          <strong>
-                            {
-                              candidate.score
-                            }
-                          </strong>
-                        </div>
-                      )
-                    )}
-                  </div>
-
-                  <div className="metric-grid">
-                    {candidates.map(
-                      (candidate) => (
-                        <div
-                          className="metric-card"
-                          key={
-                            candidate.name
-                          }
-                        >
-                          <h4>
-                            {
-                              candidate.short
-                            }
-                          </h4>
-
-                          <div>
-                            <span>
-                              RECOVERY TIME
-                            </span>
-
-                            <b>
-                              {candidate.metrics.recoveryTime.toFixed(
-                                1
-                              )}
-                              s
-                            </b>
-                          </div>
-
-                          <div>
-                            <span>
-                              RISK
-                            </span>
-
-                            <b>
-                              {
-                                candidate
-                                  .metrics
-                                  .risk
-                              }
-                              /100
-                            </b>
-                          </div>
-
-                          <div>
-                            <span>
-                              MISSION
-                              IMPACT
-                            </span>
-
-                            <b>
-                              {
-                                candidate
-                                  .metrics
-                                  .missionImpact
-                              }
-                              /100
-                            </b>
-                          </div>
-
-                          <div>
-                            <span>
-                              CONSTRAINT
-                              FIT
-                            </span>
-
-                            <b>
-                              {
-                                candidate
-                                  .metrics
-                                  .constraint
-                              }
-                              %
-                            </b>
-                          </div>
-                        </div>
-                      )
-                    )}
-                  </div>
-
-                  <div className="weights-box">
-                    <span>
-                      DECISION MODEL
-                      WEIGHTS
-                    </span>
-
-                    <div>
-                      <b>
-                        20%
-                      </b>{" "}
-                      Recovery Time
-
-                      <b>
-                        20%
-                      </b>{" "}
-                      Resource
-
-                      <b>
-                        25%
-                      </b>{" "}
-                      Risk
-
-                      <b>
-                        15%
-                      </b>{" "}
-                      Mission Impact
-
-                      <b>
-                        20%
-                      </b>{" "}
-                      Constraint Fit
-                    </div>
-                  </div>
-                </div>
-              )}
-
-              {/* RESULT */}
-
-              {plannerTab ===
-                "RESULT" &&
-                calculationFinished &&
-                selectedMethod && (
-                  <div className="result-view">
-                    <div className="decision-banner">
-                      <div className="decision-check">
-                        ✓
-                      </div>
-
-                      <div>
-                        <small>
-                          BACKEND
-                          SELECTED
-                          PROCEDURE
-                        </small>
-
-                        <h2>
-                          {
-                            selectedMethod.name
-                          }
-                        </h2>
-
-                        <p>
-                          Suitability
-                          score:{" "}
-                          <strong>
-                            {
-                              selectedMethod.score
-                            }
-                            /100
-                          </strong>
-                        </p>
-                      </div>
-                    </div>
-
-                    <div className="why-box">
-                      <span>
-                        WHY THIS METHOD?
-                      </span>
-
-                      <p>
-                        {
-                          selectedMethod.explanation
-                        }
-                      </p>
-                    </div>
-
-                    <div className="result-comparison">
-                      {candidates.map(
-                        (
-                          candidate
-                        ) => (
-                          <div
-                            key={
-                              candidate.name
-                            }
-                            className={
-                              candidate.name ===
-                              selectedMethod.name
-                                ? "result-method selected"
-                                : "result-method"
-                            }
-                          >
-                            <div>
-                              <h3>
-                                {
-                                  candidate.name
-                                }
-                              </h3>
-
-                              <span>
-                                {candidate.name ===
-                                selectedMethod.name
-                                  ? "BACKEND SELECTED"
-                                  : "ALTERNATIVE"}
-                              </span>
-                            </div>
-
-                            <strong>
-                              {
-                                candidate.score
-                              }
-                            </strong>
-                          </div>
-                        )
-                      )}
-                    </div>
-
-                    <div className="evidence-gate">
-                      <div>
-                        🔐
-                      </div>
-
-                      <div>
-                        <b>
-                          EVIDENCE GATE READY
-                        </b>
-
-                        <span>
-                          Candidate
-                          simulations,
-                          constraints
-                          and backend
-                          decision
-                          rationale
-                          have been
-                          recorded.
-                        </span>
-                      </div>
-                    </div>
-
-                    <button
-                      className="apply-button"
-                      onClick={
-                        openProofGate
-                      }
-                    >
-                      VERIFY PROOF 
-            
-
-                      <span>
-                        →
-                      </span>
-                    </button>
-                  </div>
-                )}
-            </div>
-          </div>
-        )}
-
-      {/* =====================================================
-          PROOF GATE
-      ===================================================== */}
-
-      {proofGateOpen && (
+      {plannerOpen && fault && (
         <div className="modal-backdrop">
-          <div className="evidence-modal proof-modal">
+          <div className="planner-modal">
             <div className="planner-header">
               <div>
-                <span>
-                  ZERO-TRUST // PROOF GATE
-                </span>
-
-                <h2>
-                  EVIDENCE VALIDATION
-                </h2>
+                <span>RECOVERY PLANNER // PHYSICS ENGINE</span>
+                <h2>{fault}</h2>
               </div>
 
               <button
-                onClick={() =>
-                  setProofGateOpen(
-                    false
-                  )
-                }
+                onClick={() => setPlannerOpen(false)}
               >
                 ×
               </button>
             </div>
 
-            <div className="proof-content">
-              <div className="proof-source-card">
-                <div className="proof-source-title">
-                  CALCULATION BASIS //
-                  SOURCES USED
-                </div>
-
-                <p>
-                  The recovery calculations
-                  use spacecraft-physics
-                  relationships documented
-                  in NASA technical and
-                  educational sources. The
-                  simulator applies those
-                  relationships to controlled
-                  demonstration parameters;
-                  the numerical inputs are
-                  not claimed to be live NASA
-                  mission telemetry.
-                </p>
-
-                <div className="source-list">
-                  <a
-                    href="https://www.nasa.gov/smallsat-institute/sst-soa/guidance-navigation-and-control/"
-                    target="_blank"
-                    rel="noreferrer"
-                  >
-                    NASA SmallSat GNC —
-                    reaction-wheel saturation
-                    and desaturation
-                  </a>
-
-                  <a
-                    href="https://science.nasa.gov/learn/basics-of-space-flight/chapter11-2/"
-                    target="_blank"
-                    rel="noreferrer"
-                  >
-                    NASA Science, Chapter 11 —
-                    reaction-wheel momentum and
-                    momentum desaturation
-                  </a>
-
-                  <a
-                    href="https://ntrs.nasa.gov/api/citations/19900015848/downloads/19900015848.pdf"
-                    target="_blank"
-                    rel="noreferrer"
-                  >
-                    NASA NTRS — Orbital Mechanics
-                    and ΔV / propulsion
-                    relationships
-                  </a>
-
-                  <a
-                    href="https://ntrs.nasa.gov/api/citations/20010084958/downloads/20010084958.pdf"
-                    target="_blank"
-                    rel="noreferrer"
-                  >
-                    NASA NTRS — magnetic torquer
-                    control and torque model
-                    (M × B)
-                  </a>
-
-                  <a
-                    href="https://www.nasa.gov/smallsat-institute/sst-soa/power-subsystems/"
-                    target="_blank"
-                    rel="noreferrer"
-                  >
-                    NASA SmallSat Power —
-                    power management, fault
-                    detection and load switching
-                  </a>
-
-                  <a
-                    href="https://www.nasa.gov/smallsat-institute/sst-soa/thermal-control/"
-                    target="_blank"
-                    rel="noreferrer"
-                  >
-                    NASA SmallSat Thermal Control
-                    — thermal limits, heat balance
-                    and thermal management
-                  </a>
-                </div>
-              </div>
-
-              <div className="proof-pass">
-                ✓ ALL MACHINE-CHECKABLE
-                PROOFS PASSED
-              </div>
-
-              <div className="proof-check-list">
-                <div className="evidence-gate">
-                  <div>✓</div>
-
-                  <div>
-                    <b>
-                      ANOMALY EVIDENCE
-                    </b>
-
-                    <span>
-                      Active anomaly detected
-                      and contained by the
-                      backend event.
-                    </span>
-                  </div>
-                </div>
-
-                <div className="evidence-gate">
-                  <div>✓</div>
-
-                  <div>
-                    <b>
-                      PHYSICS CALCULATIONS
-                    </b>
-
-                    <span>
-                      All candidate recovery
-                      procedures were supplied
-                      by the backend recovery
-                      engine.
-                    </span>
-                  </div>
-                </div>
-
-                <div className="evidence-gate">
-                  <div>✓</div>
-
-                  <div>
-                    <b>
-                      NUMERICAL VALIDITY
-                    </b>
-
-                    <span>
-                      Recovery metrics and
-                      suitability scores are
-                      finite and valid.
-                    </span>
-                  </div>
-                </div>
-
-                <div className="evidence-gate">
-                  <div>✓</div>
-
-                  <div>
-                    <b>
-                      CONSTRAINT CHECK
-                    </b>
-
-                    <span>
-                      Selected procedure
-                      satisfies the configured
-                      recovery constraint
-                      threshold.
-                    </span>
-                  </div>
-                </div>
-              </div>
-
-              <div className="proof-selected">
-                <b>
-                  SELECTED PROCEDURE:
-                </b>{" "}
-                {selectedMethod.name}
-
-                <br />
-
-                <span>
-                  No command is authorized
-                  until this evidence gate is
-                  explicitly passed.
-                </span>
-              </div>
-
+            {/* TABS */}
+            <div className="planner-tabs">
               <button
-                className="apply-button"
-                onClick={
-                  authorizeRecovery
+                className={
+                  plannerTab === "CALCULATION"
+                    ? "active cyan-tab"
+                    : "cyan-tab"
+                }
+                onClick={() =>
+                  setPlannerTab("CALCULATION")
                 }
               >
-                MISSION ACCOMPLISHED
-
-                <span>
-                  →
-                </span>
+                01 · LIVE CALCULATION
               </button>
 
               <button
-                className="continue-button"
-                onClick={() =>
-                  setProofGateOpen(
-                    false
-                  )
+                disabled={!calculationFinished}
+                className={
+                  plannerTab === "GRAPH"
+                    ? "active purple-tab"
+                    : "purple-tab"
                 }
+                onClick={() => setPlannerTab("GRAPH")}
               >
-                CANCEL
+                02 · METHOD GRAPH
+              </button>
+
+              <button
+                disabled={!calculationFinished}
+                className={
+                  plannerTab === "RESULT"
+                    ? "active green-tab"
+                    : "green-tab"
+                }
+                onClick={() => setPlannerTab("RESULT")}
+              >
+                03 · VIEW RESULT
               </button>
             </div>
+
+            {/* CALCULATION */}
+            {plannerTab === "CALCULATION" && (
+              <div className="calculation-view">
+                <div className="calculation-progress">
+                  <div
+                    className="progress-fill"
+                    style={{
+                      width: calculationFinished
+                        ? "100%"
+                        : `${
+                            ((calculationMethod +
+                              calculationStep /
+                                Math.max(
+                                  candidates[
+                                    calculationMethod
+                                  ]?.calculations
+                                    .length || 1,
+                                  1
+                                )) /
+                              candidates.length) *
+                            100
+                          }%`,
+                    }}
+                  />
+                </div>
+
+                <div className="method-running">
+                  METHOD {calculationMethod + 1} OF{" "}
+                  {candidates.length}
+                </div>
+
+                <div className="candidate-grid">
+                  {candidates.map((candidate, index) => (
+                    <div
+                      className={`candidate-card ${
+                        index === calculationMethod
+                          ? "running"
+                          : index < calculationMethod ||
+                            calculationFinished
+                          ? "complete"
+                          : ""
+                      }`}
+                      key={candidate.name}
+                    >
+                      <div
+                        className="candidate-accent"
+                        style={{
+                          background:
+                            candidate.color,
+                        }}
+                      />
+
+                      <div>
+                        <small>
+                          METHOD {index + 1}
+                        </small>
+                        <h3>{candidate.name}</h3>
+                      </div>
+
+                      <span>
+                        {index < calculationMethod ||
+                        calculationFinished
+                          ? "✓"
+                          : index ===
+                            calculationMethod
+                          ? "CALCULATING"
+                          : "QUEUED"}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+
+                {!calculationFinished && (
+                  <div className="live-calculation-box">
+                    <div className="live-header">
+                      <span className="live-dot" />
+                      LIVE PHYSICS CALCULATION
+                    </div>
+
+                    <h3>
+                      {
+                        candidates[calculationMethod]
+                          ?.name
+                      }
+                    </h3>
+
+                    <div className="equation-list">
+                      {candidates[
+                        calculationMethod
+                      ]?.calculations.map(
+                        (line, index) => (
+                          <div
+                            className={
+                              index <
+                              calculationStep
+                                ? "equation visible"
+                                : "equation"
+                            }
+                            key={line}
+                          >
+                            <span>
+                              {index <
+                              calculationStep
+                                ? "✓"
+                                : "○"}
+                            </span>
+                            <code>{line}</code>
+                          </div>
+                        )
+                      )}
+                    </div>
+
+                    <div className="calculating-text">
+                      {calculationStep <
+                      candidates[
+                        calculationMethod
+                      ]?.calculations.length
+                        ? "COMPUTING..."
+                        : calculationMethod <
+                          candidates.length - 1
+                        ? "METHOD COMPLETE — LOADING NEXT METHOD"
+                        : "ALL METHODS CALCULATED"}
+                    </div>
+                  </div>
+                )}
+
+                {calculationFinished && (
+                  <div className="calculation-complete">
+                    <div className="complete-icon">
+                      ✓
+                    </div>
+
+                    <div>
+                      <h3>
+                        Both recovery procedures
+                        calculated.
+                      </h3>
+
+                      <p>
+                        No recovery command has been
+                        executed. The system has only
+                        simulated and compared the
+                        candidate procedures.
+                      </p>
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* GRAPH */}
+            {plannerTab === "GRAPH" && (
+              <div className="graph-view">
+                <div className="graph-heading">
+                  <div>
+                    <span>COMPARATIVE ANALYSIS</span>
+                    <h3>
+                      Why one recovery procedure is
+                      more suitable
+                    </h3>
+                  </div>
+
+                  <div className="score-legend">
+                    Higher suitability = better
+                  </div>
+                </div>
+
+                <div className="graph-card">
+                  {candidates.map((candidate) => (
+                    <div
+                      className="graph-row"
+                      key={candidate.name}
+                    >
+                      <div className="graph-label">
+                        <span
+                          style={{
+                            color: candidate.color,
+                          }}
+                        >
+                          ●
+                        </span>
+                        {candidate.short}
+                      </div>
+
+                      <div className="bar-track">
+                        <div
+                          className="bar-fill"
+                          style={{
+                            width: `${candidate.score}%`,
+                            background:
+                              candidate.color,
+                            boxShadow: `0 0 18px ${candidate.color}66`,
+                          }}
+                        />
+                      </div>
+
+                      <strong>
+                        {candidate.score}
+                      </strong>
+                    </div>
+                  ))}
+                </div>
+
+                <div className="metric-grid">
+                  {candidates.map((candidate) => (
+                    <div
+                      className="metric-card"
+                      key={candidate.name}
+                    >
+                      <h4>{candidate.short}</h4>
+
+                      <div>
+                        <span>
+                          RECOVERY TIME
+                        </span>
+                        <b>
+                          {candidate.metrics.recoveryTime.toFixed(
+                            1
+                          )}
+                          s
+                        </b>
+                      </div>
+
+                      <div>
+                        <span>RISK</span>
+                        <b>
+                          {candidate.metrics.risk}
+                          /100
+                        </b>
+                      </div>
+
+                      <div>
+                        <span>MISSION IMPACT</span>
+                        <b>
+                          {candidate.metrics.missionImpact}
+                          /100
+                        </b>
+                      </div>
+
+                      <div>
+                        <span>CONSTRAINT FIT</span>
+                        <b>
+                          {candidate.metrics.constraint}
+                          %
+                        </b>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+
+                <div className="weights-box">
+                  <span>
+                    DECISION MODEL WEIGHTS
+                  </span>
+                  <div>
+                    <b>20%</b> Recovery Time
+                    <b>20%</b> Resource
+                    <b>25%</b> Risk
+                    <b>15%</b> Mission Impact
+                    <b>20%</b> Constraint Fit
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* RESULT */}
+            {plannerTab === "RESULT" &&
+              calculationFinished &&
+              selectedMethod && (
+                <div className="result-view">
+                  <div className="decision-banner">
+                    <div className="decision-check">
+                      ✓
+                    </div>
+
+                    <div>
+                      <small>
+                        SELECTED PROCEDURE
+                      </small>
+
+                      <h2>
+                        {selectedMethod.name}
+                      </h2>
+
+                      <p>
+                        Suitability score:{" "}
+                        <strong>
+                          {selectedMethod.score}
+                          /100
+                        </strong>
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="why-box">
+                    <span>WHY THIS METHOD?</span>
+                    <p>
+                      {selectedMethod.explanation}
+                    </p>
+                  </div>
+
+                  <div className="result-comparison">
+                    {candidates.map((candidate) => (
+                      <div
+                        key={candidate.name}
+                        className={
+                          candidate.name ===
+                          selectedMethod.name
+                            ? "result-method selected"
+                            : "result-method"
+                        }
+                      >
+                        <div>
+                          <h3>
+                            {candidate.name}
+                          </h3>
+
+                          <span>
+                            {candidate.name ===
+                            selectedMethod.name
+                              ? "SELECTED"
+                              : "ALTERNATIVE"}
+                          </span>
+                        </div>
+
+                        <strong>
+                          {candidate.score}
+                        </strong>
+                      </div>
+                    ))}
+                  </div>
+
+                  <div className="evidence-gate">
+                    <div>🔐</div>
+
+                    <div>
+                      <b>
+                        EVIDENCE GATE READY
+                      </b>
+
+                      <span>
+                        Candidate simulations,
+                        constraints and decision
+                        rationale have been recorded.
+                      </span>
+                    </div>
+                  </div>
+
+                  <button
+                    className="apply-button"
+                    onClick={applyRecovery}
+                  >
+                    APPLY SELECTED RECOVERY
+                    <span>→</span>
+                  </button>
+                </div>
+              )}
           </div>
         </div>
       )}
 
-      {/* =====================================================
+      {/* -------------------------------------------------
           EVIDENCE VAULT
-      ===================================================== */}
+      ------------------------------------------------- */}
 
       {evidenceOpen && (
         <div className="modal-backdrop">
           <div className="evidence-modal">
             <div className="planner-header">
               <div>
-                <span>
-                  ZERO-TRUST AUDIT TRAIL
-                </span>
-
-                <h2>
-                  EVIDENCE VAULT
-                </h2>
+                <span>ZERO-TRUST AUDIT TRAIL</span>
+                <h2>EVIDENCE VAULT</h2>
               </div>
 
               <button
-                onClick={() =>
-                  setEvidenceOpen(
-                    false
-                  )
-                }
+                onClick={() => setEvidenceOpen(false)}
               >
                 ×
               </button>
             </div>
 
             <div className="evidence-intro">
-              Every anomaly, simulation,
-              constraint check, recovery
-              decision and telemetry
-              verification remains stored
-              until RESET MISSION.
+              Every anomaly, simulation, constraint
+              check, recovery decision and telemetry
+              verification remains stored until RESET
+              MISSION.
             </div>
 
             <div className="evidence-list">
-              {evidence.length ===
-              0 ? (
+              {evidence.length === 0 ? (
                 <div className="empty-evidence">
-                  NO EVIDENCE
-                  RECORDED
+                  NO EVIDENCE RECORDED
                 </div>
               ) : (
-                evidence.map(
-                  (item) => (
-                    <div
-                      className="evidence-row"
-                      key={item.id}
-                    >
-                      <div className="evidence-line">
-                        <span />
-                      </div>
-
-                      <div className="evidence-content">
-                        <div>
-                          <span>
-                            {item.time}
-                          </span>
-
-                          <b
-                            className={`evidence-status ${item.status.toLowerCase()}`}
-                          >
-                            {
-                              item.status
-                            }
-                          </b>
-                        </div>
-
-                        <strong>
-                          {item.type}
-                        </strong>
-
-                        <p>
-                          {item.detail}
-                        </p>
-                      </div>
+                evidence.map((item) => (
+                  <div
+                    className="evidence-row"
+                    key={item.id}
+                  >
+                    <div className="evidence-line">
+                      <span />
                     </div>
-                  )
-                )
+
+                    <div className="evidence-content">
+                      <div>
+                        <span>
+                          {item.time}
+                        </span>
+
+                        <b
+                          className={`evidence-status ${item.status.toLowerCase()}`}
+                        >
+                          {item.status}
+                        </b>
+                      </div>
+
+                      <strong>
+                        {item.type}
+                      </strong>
+
+                      <p>{item.detail}</p>
+                    </div>
+                  </div>
+                ))
               )}
             </div>
           </div>
